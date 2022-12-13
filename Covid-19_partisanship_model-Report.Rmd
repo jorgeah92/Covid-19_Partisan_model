@@ -1,0 +1,563 @@
+---
+title: "W203 Lab3 Final"
+author: "by: Richard Cziva, Jorge Hernandez, and Jonathan Wong"
+subtitle: "Professor Oleg Melnikov, Section 1 (Cziva & Wong), Section 6 (Hernandez)"
+output:
+  pdf_document: default
+  html_document: default
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyhead[LO,LE]{State Governor Partisanship and the Covid-19 Death Toll}
+- \fancyfoot[LO,LE]{Cziva, Hernandez, and Wong}
+---
+
+
+***
+
+# A Regression Study of Covid-19 #
+
+# Introduction #
+
+### **Question**: Is there a relationship between state governor partisanship and the COVID-19 death toll?
+
+What began as just another pandemic happening on the other side of the world, COVID-19 has since spread globally and become very real for many of us.  It has become the front page headline in every media outlet, the topic of conversations everywhere, and a concern for most when they step out the door.  The science behind stemming this pandemic seems simple enough-- minimize contact between people to reduce its spread and the virus will burn itself out.
+
+Unfortunately, such a simple concept has proven to be difficult to implement, especially in a country like the United States where we hold the notion of freedom so dearly. The varied responses and attitudes between our 50 states toward this outbreak seem to be rooted in philosophical and cultural differences of Republicans and Democrats.  The Republicans generally seem to discount science by ignoring the advice of experts, resist the idea of establishing a sheltering in place protocol, and downplaying the seriousness of the virus. Democrats, on the other hand, seem more willing to make sacrifices and readily implement measures to "flatten the curve" of the number of infections.
+
+We are curious if these partisan differences toward COVID-19 make any difference in the bottom line; the death toll of the virus. Since state governors have the ultimate authority to implement emergency responses to this pandemic, we endeavor to analyze and measure the effect, if any, of state governor partisanship on their respective states' death toll.
+
+
+# Model Building Process #
+
+## EDA ##
+
+As we embark on our exploratory analysis, it is important to keep in mind what it is we would like to measure. Our question can be broken down into multiple parts such as what role did governors' political affiliation play in their response to COVID-19 and how did those responses affect the death toll? Ultimately, the objective is to determine if there is a relationship between partisanship and death toll of the states.  To that end, the variables of interest include:
+
+- `total_cases` - Total # of Covid Cases.
+- `total_test_results` - Total # of Tests Performed.
+- `total_deaths` - # of deaths caused by Covid.
+- `death_100k` - Death Rate per 100k.
+- `pop_2018`: Population as of 2018.
+- `pop_density`: Population Density per Square Miles.
+- `Governor Political Affiliation`: Categorical Variable of Governor's Political Party (ie. Republican, Democrat, etc).
+
+```{r message=FALSE}
+#install.packages("car")
+#install.packages("dplyr")
+#install.packages("stargazer")
+library(lmtest)
+library(sandwich)
+library(car)
+library(dplyr)
+library(stargazer)
+```
+
+A number of irregularities exist in the provided dataset.  The list below describes those irregularities and the actions taken:
+
+- Header updated with meaningful and abbreviated variable names.
+- **Arizona** appears twice; a capitalized version and a non-capitalized one.  Their data weren't the same so we cross-referenced the data and discarded the version with the incorrect data.
+- Some shelter-in-place data was missing.  We cross-referenced the provided dataset with https://www.finra.org/rules-guidance/key-topics/covid-19/shelter-in-place.  Any discrepancies were further cross-referenced with other sites.  Missing data was filled in.
+- **Ohio** census data partially missing in provided dataset.  These missing figures were obtained and updated accordingly using data from https://data.census.gov/.
+- **Kentucky** missing Total Test Results data.  Data obtained from https://covidtracking.com/data/state/kentucky and dataset updated.
+
+The resulting dataset was compiled in a new file: **covid-data-cleaned.csv**.
+
+```{r}
+# Load Covid data.
+c <- read.csv("covid-data-cleaned.csv", header = TRUE)
+```
+
+State political party information was not included in the dataset and therefore obtained externally from: https://www.kff.org/other/state-indicator/state-political-parties/.  This information was joined with existing dataset using the `state` variable as the key.
+
+```{r}
+# Load External Data pertaining to State Party Affiliations.
+party <- read.csv("Party_by_state.csv", header=FALSE)
+```
+
+```{r}
+# Cleanup Party Data
+names(party) <- as.matrix(party[3, ])
+party <- party[-c(1:3), -c(7)]
+```
+
+```{r}
+# Add Party dataframe to c dataframe
+b <- left_join(c, party, by=c( "state" = "Location"))
+```
+
+In order to utilize shelter-in-place dates meaningfully, we transformed `date_sip_start` and `date_sip_end` variables to derive the new variable `sip_duration`.  This new variable is intended to serve as an indication of state governors' political will in shutting down for the purpose of stemming the spread of COVID-19.
+
+```{r}
+# Convert Values Under SIP to Date Values so that they can be Subtracted
+b$date_sip_start <- as.character(b$date_sip_start)
+b$date_sip_start <- as.Date(b$date_sip_start, format='%m/%d/%Y')
+
+b$date_sip_end <- as.character(b$date_sip_end)
+# Last day data was updated for shelter in place
+b$date_sip_end[b$date_sip_end == '0'] <- "7/2/2020"
+b$date_sip_end <- as.Date(b$date_sip_end, format='%m/%d/%Y')
+```
+
+```{r}
+# Form Date Difference
+b$sip_duration <- b$date_sip_end - b$date_sip_start
+b$sip_duration[is.na(b$sip_duration)] <- 0
+```
+
+```{r}
+# Perform sanity check the variables we are interested in.
+i.data <- data.frame(b$state, b$death_100k, b$sip_duration,
+                     b$pop_density, b$`Governor Political Affiliation`)
+# Abbreviate Governor Political Affiliation.
+names(i.data)[5] <- "gov_party"
+head(i.data)
+```
+
+As mentioned in the Introduction, state governors have the ultimate authority to order emergency measures and responses to pandemics.  They also are voted into office by their state constituents and therefore should presumably represent the partisan majority of their respective states.  So, we feel this variable serves as a good proxy for measuring how partisanship affects the death toll.
+
+Categorical variables, such as `Governor Political Affiliation`, cannot be used in linear regression.  Thus, we are transforming it using the following indicator function:
+
+```{r}
+# Indicator Function for Party Affiliation.
+# Republican       = 1
+# Democrat / other = 0
+partyIndicator <- function(partyList) {
+
+  numericList <- c()
+
+  for (party in partyList) {
+    code = 3
+    if (!is.na(party)) {
+      if (party == "Republican") {
+        code = 1
+      }
+      if (party == 'Democrat') {
+        code = 0
+      }
+    } else {
+      code = 0
+    }
+
+    numericList <- c(numericList, code)
+  }
+  numericList
+}
+```
+
+```{r}
+# Add "gov_party" Column to "b"; a numeric indicator of Governor Political Affiliation.
+b[["gov_party"]] <- partyIndicator(b$`Governor Political Affiliation`)
+```
+
+
+
+```{r}
+# Render Histogram of Governor Political Affiliation.
+# Blue = Democrats, Red = Republicans
+options(repr.plot.height=3, repr.plot.width=5)
+hist(partyIndicator(b$`Governor Political Affiliation`), breaks= 0:2-.5,
+     col=c("blue", "red"),
+     main="Histogram of Governor Political Affiliation", xlab="Party affiliation")
+
+```
+
+Displayed above is a histogram of Governor Political Affiliation for the United States. This graph gives us an idea of how the country's political stance lines up.
+
+```{r}
+# Summarize Newly Transformed Shelter-in-Place variable "sip_duration".
+summary(as.numeric(b$sip_duration))
+
+# Render Histogram of "sip_duration".
+options(repr.plot.height=3, repr.plot.width=5)
+hist(as.numeric(b$sip_duration), col="lightblue", breaks=10, main="Histogram of sip_duration")
+```
+
+This histogram shows the distribution of how long Shelter in Place protocols have been established across the United States. It depicts a graph similar to bell shaped curve centered around 40 days.
+
+```{r}
+# Length of Shelter In Place in States w/ Democratric Governors.
+paste("Democratic Governors Shelter-in-Place Days: ",
+  round(mean((b[which(b$`Governor Political Affiliation` == 'Democrat'),])$sip_duration)))
+# Length of Shelter In Place in States w/ Republican Governors.
+paste("Republican Governors Shelter-In-Place Days: ",
+  round(mean((b[which(b$`Governor Political Affiliation` == 'Republican'),])$sip_duration)))
+```
+
+The variable `death_100k` should be a good candidate as the dependent variable in our model since we are investigating if there is a relationship between state governors' party affiliation and the death toll.  
+
+We will check if its data is clean, reliable, and if any transformations of it are appropriate.  
+
+```{r}
+# Summarize "death_100K".
+summary(b$death_100k)
+
+# Render Histogram of "death_100k".
+options(repr.plot.height=3, repr.plot.width=5)
+hist(b$death_100k, col="pink", breaks=20, main="Histogram of death_100k")
+```
+
+When looking at the plot comparing shelter in place duration to death per 100k people, two outliers from the rest of the data are shown. One of the outliers, the larger one, can be explained by the situation that occurred in New York during the early stage of the outbreak in the United States. Through investigation of the values in the dataframe, b, the other outlier is Colorado which is unexplained. After reviewing the Center of Disease Control site at https://www.cdc.gov/coronavirus/2019-ncov/cases-updates/us-cases-deaths.html, we conclude that this is incorrect and the death per 100k variable should be recalculated.  The `death_100k` is updated with the correct calculation below:
+
+```{r}
+# Clean and Transform data in "death_100k" with Correct Calculation.
+dr <- b$total_deaths / (b$pop_2018 / 100000)
+b$death_100k <- round(dr, digits=1)
+```
+
+```{r}
+# Summarize "death_100K".
+summary(b$death_100k)
+```
+
+```{r}
+# Configure to render histograms side-by-side.
+par(mfrow=c(2,2))
+
+# Boxplot of death_100k (above Histogram for visual effect).
+boxplot(b$death_100k, horizontal=TRUE, main="death_100k (recalc'd)")
+
+# Boxplot of log(death_100k) (above Histogram for visual effect).
+boxplot(log(b$death_100k), horizontal=TRUE, main="log(death_100k)")
+
+# Render Histogram of "death_100k".
+# options(repr.plot.height=3, repr.plot.width=8)
+hist(b$death_100k, col="pink", breaks=20, main=NULL)
+
+#  Normalize death_100k using  Logarithmic Transformation.
+hist(log(b$death_100k), col="pink", breaks=20, main=NULL)
+```
+
+After recalculating the `death_100k`, we examined a Logarithmic transformation on the variable to determine if the transformation would be more suitable in our investigation. The Logarithmic transformation shows an easier to interpret graph that can better explain the distribution of `death_100k`.
+
+
+To correctly and meaningfully compare the death tolls between states, the ratio of deaths / population must be used.  To illustrate that `death_100k` is such a ratio, we compare `death_100k` by (`total_deaths`/`pop_2018`) * 100000.  If the results are the same, then `death_100k` is a valid variable to use in this analysis.
+
+```{r}
+# Create data frame with the variables we want to compare.
+death.data<- data.frame(b$state, b$death_100k, round((b$total_deaths/b$pop_2018)*100000, 1))
+# Abbreviate round((b$total_deaths/b$pop_2018)*100000, 1).
+names(death.data)[3] <- "total_deaths/pop_2018*100000"
+# Run sanity check.
+head(death.data)
+```
+
+Based on the above, `death_100k` is confirmed to be a ratio of deaths per 100k people and we therefore deem it a valid variable to be used in our analysis.
+
+We are looking into `pop_density` as an explanatory variable since proximity plays a role in transmission rates-- the more people there are in a particular area, the more people who will catch the disease. Therefore we are determining whether the distribution of `pop_density` requires a transformation.
+
+```{r}
+# Configure to render histograms side-by-side.
+par(mfrow=c(2,2))
+
+# Boxplot of pop_density (above Histogram for visual effect).
+boxplot(b$pop_density, horizontal=TRUE, main="pop_density")
+
+# Boxplot of log(pop_density) (above Histogram for visual effect).
+boxplot(log(b$pop_density), horizontal=TRUE, main="log(pop_density)")
+
+# Historgram of pop_density.
+hist(b$pop_density, col='green', breaks=50, main=NULL)
+
+#  Normalize pop_density using Logarithmic Transformation.
+hist(log(b$pop_density), col='green', breaks=50, main=NULL)
+
+```
+A Logarithmic transformation shows clearer representation of `pop_density`and therefore easier to interpret.
+
+```{r}
+options(repr.plot.height=6, repr.plot.width=6)
+
+# Render scatterplotMatrix of: log(death_100k), sip_duration, log(pop_density), gov_party.
+y <- data.frame(log(b$death_100k), b$sip_duration, log(b$pop_density), b$gov_party)
+scatterplotMatrix(y,
+                  regLine=list(col=c("blue","green", "yellow")),
+                  col=c("black"), smooth=list(col.smooth="green", col.spread="red"))
+
+```
+
+```{r }
+# Create Dataframe of Variables of Interest.
+c.data<- data.frame(log(b$death_100k),
+                    as.numeric(b$sip_duration),
+                    log(b$pop_density),
+                    b$gov_party)
+
+# Abbreviate "log.b.death_100k." with "log(death_100k)".
+names(c.data)[names(c.data) == "log.b.death_100k."] <- "log(death_100k)"
+# Abbreviate "as.numeric.b.sip_duration" with "sip_duration".
+names(c.data)[names(c.data) == "as.numeric.b.sip_duration."] <- "sip_duration"
+# Abbreviate "log.b.pop_density" with "log(pop_density".)
+names(c.data)[names(c.data) == "log.b.pop_density."] <- "log(pop_density)"
+# Abbreviate "b.gov_party" with "gov_party".
+names(c.data)[names(c.data) == "b.gov_party"] <- "gov_party"
+
+
+
+# Determine if there are Correlations between the Variables of Interest.
+corMatrix <- round(cor(c.data),2)
+corMatrix
+```
+
+Based on the Correlation Matrix above, it appears we have meaningful correlations between `death_100k` and the variables of interest which will prove useful in building our models.
+
+## Models ##
+
+```{r}
+# Add "gov_party" Column to "b" which is a numeric representation of Governor Political Affiliation.
+b[["gov_party"]] <- partyIndicator(b$`Governor Political Affiliation`)
+```
+
+The base model below only includes the explanatory variable `gov_party`, which is an indicator of the Governor Party Affiliation (0 = Democrat, 1 = Republican) since our goal was to measure the effect of governor partisanship on the death toll *(research question)*.
+
+```{r}
+(cmodel1 <- lm(log(death_100k) ~ gov_party, data=b))
+summary(cmodel1)
+```
+
+Our second model below adds `log(pop_density)` as an explanatory variable which resulted in a reduction of standard error compared to the base model above.
+
+```{r}
+(cmodel2 <- lm(log(death_100k) ~ gov_party + log(pop_density), data=b))
+summary(cmodel2)
+```
+
+Finally, in our third model, we include `sip_duration` which resulted in a slight reduction of standard error.
+
+```{r}
+(cmodel3 <- lm(log(death_100k) ~ gov_party + log(pop_density) + sip_duration , data=b))
+summary(cmodel3)
+```
+
+
+
+# Assessment of CLM Assumptions #
+
+We are going to assess the assumptions on our best model, `cmodel2`. Below, let's plot the most common diagnostic plots for our model.
+
+```{r}
+options(repr.plot.height=5, repr.plot.width=6)
+par(mfrow=c(2,2))
+plot(cmodel2)
+```
+
+### Linearity (MLR.1) ###
+
+log(death_100k) is a linear function of `gov_party` and `log(pop_density)` in the model: $\log(death\_100k) = \beta_0 + \beta_1(gov\_party) + \beta_2 log(pop\_density)$. That is, `death_100k` is linear to $\beta_0, \beta_1$, and $\beta_2$. We have one constant, $\beta_0$ and  followed by parameters that multiplied by independent variables. The error has not been constrained in any way so there is nothing to test. Therefore, Assumption MLR.1 has been satisfied.
+
+
+### Random sampling (MLR.2) ###
+
+Random sampling means data is independent and identically distributed. This is something that we assume from the data obtained. There are two common ways this can fail:
+
+- Clustering of Data: This is needed to be satisfied by the researchers taking the data. However, even with clustering, the OLS coefficients are unbiased (but estimates are much less precise). If clustering to be found, we would use clustered standard errors.
+- Autocorrelation: This occurs when the error for one data point is correlated with the error for the next data point.
+
+To test Autocorrelation, we can use the Durbin-Watson test. This tests the hypothesis of "no first order autocorrelation in the model".
+
+```{r}
+durbinWatsonTest(cmodel2)
+```
+
+We have a test statistic of 1.67 that is inside the acceptable range (1.5-2.5) and a p-value of 0.228.  The Null Hypothesis of the Durbin Watson Test is that there is **no autocorrelation** and we failed to reject it. Therefore we can conclude that there is no autocorrelation in our data.
+
+### No perfect collinearity (MLR.3) ###
+
+Let's see if there is correlation between our predictors.
+
+```{r}
+vif(cmodel2)
+```
+
+The smallest possible value of VIF is one (absence of multicollinearity). As a rule of thumb, a VIF value that exceeds 5 or 10 indicates a problematic amount of collinearity (James et al. 2014).
+
+As our VIF values are low, we can conclude that we don't have perfect collinearity.
+
+### Zero Conditional Mean (MLR.4) ###
+
+The Zero Conditional Mean assumption stipulates that the explanatory variables must contain no information about the mean of the unobserved factors. It is summarized elegantly as follows:
+$$E(u_i|x_{i1}, x_{i2}, ..., x_{ik})=0$$
+
+To test if our model conforms to this assumption, we can turn to a `Residual vs. Fitted Values Plot`.
+
+```{r, fig.width = 6, fig.height = 4}
+# Plot Residuals vs. Fitted to assess Zero Conditional Mean.
+plot(cmodel2, which = 1)
+```
+
+Ideally, the red spline curve should be completely flat which would indicate that the means of the residuals is zero across the fitted values.  In our plot above, we see that our model has achieved a spline that is reasonably flat.  At the right side of the spline there is a slight spike and then dip.  With a sample size of only 50 (50 states), the lack of data points on the right contributes to that dip.
+
+It's worth noting that we can never know for certain if average value of unobserved factors is unrelated to our explanatory variables, but we will proceed assuming that they are and that MLR.4 has not been violated.
+
+
+## Homoskedasticity (MLR.5) ##
+
+MLR.5 assumes that the variance of the error term is constant.  This is known as `Homoskedasticity`.  It should be noted that it is often unrealistic to expect homoskedasticity in real-world data.  We can work around heteroskedasticity if necessary.
+
+To deteremine if we have Homoskedasticity in our model, we can look at two plots.  The first plot is the `Residuals vs. Fitted`, which we relied on to assess the MLR.4 Zero Conditional Mean Assumption.  It's difficult to tell by looking at that plot so we will turn to a couple of other methods to evaluate.
+
+The other plot we can use to evaluate Homoskedasticity is the `Scale-Location Plot`.
+
+```{r, fig.width = 6, fig.height = 4}
+# Execute Scale-Location Plot to assess Homoskedasticity.
+plot(cmodel2, which = 3)
+```
+
+As with the `Residuals vs. Fitted` plot, the `Scale-Location Plot` shows a horizontal band of points which implies that the variance of the error terms of the model is constant.  Conservatively speaking, there is so far no evidence that heteroskedasticity exists.
+
+Lastly, the Breusch-Pagan Test will give us additional insight on this matter:
+
+```{r}
+bptest(cmodel2)
+```
+
+Based on the Breusch-Pagan test, we fail to reject the Null Hypothesis that the model has Homoscedasticity.  
+
+We, therefore, will proceed under the assumption that MLR.5 has not been violated.
+
+
+
+## Normality of Errors (MLR.6) ##
+
+MLR.6 assumes that the population error u is independent of the explanatory variables $x_1, x_2, ..., x_k$ and is normally distributed with zero mean and variance $\sigma^2: u ~ Normal(0, \sigma^2)$.
+
+```{r, fig.width = 6, fig.height = 4}
+# Execute QQ-plot to assess Normality.
+plot(cmodel2, which = 2)
+```
+
+The Q-Q plot above suggests normality of errors with one outlier point.
+
+Let's look at this a bit closer with a histogram and fitted normal curve:
+
+```{r}
+options(repr.plot.height=3, repr.plot.width=5)
+h <- hist(cmodel2$residuals, density = 30,
+          col = "lightgray", xlab = "Accuracy", main = "Histogram of errors", xlim = c(-3,3))
+xfit <- seq(min(cmodel2$residuals), max(cmodel2$residuals), length = 40)
+yfit <- dnorm(xfit, mean = mean(cmodel2$residuals), sd = sd(cmodel2$residuals))
+yfit <- yfit * diff(h$mids[1:2]) * length(cmodel2$residuals)
+
+lines(xfit, yfit, col = "black", lwd = 2)
+```
+
+The residuals do not fit the normal line perfectly, as there is one outlier point. If we were to remove that outlier, we would fit normal curve better.
+
+To further examine normality of errors, we can run a statistical test, the Shapiro-Wilk test. The null hypothesis is that the residuals are normally distributed.
+
+```{r}
+shapiro.test(cmodel2$residuals)
+```
+
+With p value of 0.01136 we can reject the Null Hypothesis and say that the residuals are not normally distributed. This assumption is ambiguous, but even if we considered it not satisfied, we feel that with the sample size being relatively large (>30), we can rely on CLM to proceed.
+
+# Regression Table #
+
+```{r}
+# Calculate Standard errors for models
+se.model1 <- sqrt(diag(vcovHC(cmodel1)))
+se.model2 <- sqrt(diag(vcovHC(cmodel2)))
+se.model3 <- sqrt(diag(vcovHC(cmodel3)))
+```
+Despite our model meeting the assumption of homoskedasticity, it is good practice to use standard errors that are robust enough to deal with heteroskedasticity instead of errors produced by the linear model package since no real-world problem will perfectly fit the assumption, so new standard errors are calculated to take a violation into account.
+
+```{r}
+# Forms a regression table
+star_output <- stargazer(cmodel1, cmodel2, cmodel3, type="text",
+          title = "Linear Models Predicting Normalized degree of COVID cases",
+          se = list(se.model1, se.model2, se.model3),
+          dep.var.labels=c("model"),
+          omit.stat = "f",
+          star.cutoffs = c(0.05, 0.01, 0.001))
+```
+
+The first model shows an adjusted $r_2$ of $0.046$ and shows no statistical significance for the governor party affiliation coefficient. This may be due to the sample size not being large enough to account for the variability in the data. On our model of choice, the `log(pop_density)` coefficient shows to have a high statistical significance, $p<0.001$, and the adjusted $r_2$ moves to $0.481$ meaning that almost half the variation in the final model is explained by the linear regression. This may not seem very meaningful but in a practical sense it is a good estimator for explaining the cause of the difference in death tolls.
+
+In terms of practical senses of our model, we will look at the various effects that the independent variables have on the dependent variable. For the `sip_duration` (shelter in place duration), our final model is indicating that there is a small negative effect on death tolls with longer durations. The model shows that with each day in SIP duration, the death toll is affected by 0.8%. This may not seem like a large effect due to the length of the SIP variable used for our model but with time the difference in death toll will increase. However, since this value showed no statistical significance it can not be relied on for indication of death toll. On the other hand, the `log(pop_density)` has a large and positive effect on the death toll which makes sense since the more people closer together the more the virus spreads and therefore the more the death toll will increase. With each percentage increase in population density, the percentage increase in death tolls increases by half . The last variable, `gov_party`, has a negative effect on the death toll in our model, meaning that states with governors who are Republican seem to have a smaller percentage of deaths from COVID. This is a surprising find but may be misleading due to the large outbreak in cases that happened in New York in the beginning of the pandemic in the United States. However, the models will not be a complete representation of the United States’ current outcome to the pandemic with New York's exclusion and since there was no statistical significance to this value it should not be used for an indication of death toll either.
+
+
+
+# Discussion of Omitted Variables #
+
+OLS estimators become biased when variables that belong to the population model are omitted. Explained in simple terms, when an important variable is left out of the model, the coefficients of the included variables end up "doing extra work" for the model to perform.
+
+In our analysis, we found that Population Density (`pop_density`) had a statistically significant effect on the states' death toll. While that  may make intuitive sense, we cannot assume our estimator hasn't been biased due to omitted variables.  In this section, we will consider a few variables that could be biasing our estimates.
+
+It should be noted that the Omitted Variables proposed in this section need to be compared to an existing variable in our model to derive the direction of the bias (away or toward zero). We chose to compare the omitted variables in this section to $\beta_2$, the coefficient for `log(pop_density)`, despite our research being oriented more towards $\beta_1$, the coefficient for `gov_party` (our research question pertains to how State Governor Partisanship relates to the Covid-19 death toll).  This is because the coefficient for the variable `log(pop_density)`, $\beta_2$, exhibited statistical significance in our model, unlike $\beta_1$.  
+
+$\beta_2$ is **positive** because the independent variable `pop_density` and dependent variable `death_100k` is positively correlated. In other words, the denser the population, the higher the death toll.  Intuitively speaking, variables that stem Covid-19 spread, that were omitted, should have a **negative** bias effect, toward 0, on $\beta_2$.  Any omitted variable that increases the spread, will have a **positive** bias on $\beta_2$, away from zero.
+
+Here is the model for which we will use to analyze Omitted Variables (`model2` from **Model Building Process**):
+
+$$log(death\_100k) = \beta_0 + \beta_1 gov\_party + \beta_2 log(pop\_density) + u $$
+
+***
+
+Omitted Variable: `social_distance_attitudes` (Social Distancing Attitudes):
+
+$$log(death\_100k) = \beta_0  + \beta_2 log(pop\_density) + \beta_3 social\_dist\_attitiudes + u $$
+$$social\_dist\_attitudes = \alpha_0 + \alpha_2 log(pop\_density) + u$$
+If $\beta_3$ > $0$ and $\alpha_2$ > $0$ then $OMVB$ = $\beta_3$ $\alpha_2$ > $0$ and if $\beta_2$ > $0$ then the OLS coefficient on `log(pop_density)` will be scaled away from zero (more positive) gaining statistical significance.
+
+***
+
+Omitted Variable: `prop_wfh_option` (Proportion of Population with Work from Home Option):
+
+$$log(death\_100k) = \beta_0 + \beta_2 log(pop\_density) + \beta_3 prop\_wfh\_option + u$$
+$$prop\_wfh\_option = \alpha_0 + \alpha_2 log(pop\_density) + u$$
+If $\beta_3$ < $0$ and $\alpha_2$ > $0$ then $OMVB$ = $\beta_3$ $\alpha_2$ < $0$ and if $\beta_2$ > $0$ then the OLS coefficient on `log(pop_density)` will be scaled toward zero (less positive) losing statistical significance.
+
+***
+
+Omitted Variable: `testing_avail` (Covid-19 Testing Availability):
+
+$$log(death\_100k) = \beta_0 + \beta_2 log(pop\_density) + \beta_3 testing\_avail + u $$
+$$testing\_avail = \alpha_0 + \alpha_2 log(pop\_density) + u$$
+If $\beta_3$ < $0$ and $\alpha_2$ > $0$ then $OMVB$ = $\beta_3$ $\alpha_2$ < $0$ and if $\beta_2$ > $0$ then the OLS coefficient on `log(pop_density)` will be scaled towards from zero (less positive) losing statistical significance.
+
+***
+
+Omitted Variable: `ctac_tracing_date` (Contract Tracing Implementation Date):
+
+$$log(death\_100k) = \beta_0 + \beta_2 log(pop\_density) + \beta_3 ctac\_tracing\_date + u$$
+$$ctac\_tracing\_date = \alpha_0 + \alpha_2 log(pop\_density) + u$$
+If $\beta_3$ < $0$, $\alpha_2$ > $0$ then $OMVB$ = $\beta_3$ $\alpha_2$ < $0$ and if $\beta_2$ > $0$ then the OLS coefficient on `log(pop_density)` will be scaled towards zero (less positive) losing significance.
+
+***
+
+Omitted Variable: `first_covid_duration` (Elapsed Time Since First Covid-19 Case in State):
+
+$$log(death\_100k) = \beta_0 + \beta_2 log(pop\_density) + \beta_3 first\_covid\_duration + u$$
+$$first\_covid\_duration = \alpha_0 + \alpha_2 log(pop\_density) + u$$
+If $\beta_3$ > $0$, $\alpha_2$ > $0$ then $OMVB$ = $\beta_3$ ($\alpha_2$) > $0$ and if $\beta_2$ > $0$ then the OLS coefficient on `log(pop_density)` will be scaled away from zero (more positive) gaining statistical significance.
+
+***
+
+Here is a summary of the omitted variables discussed in this section and their estimated direction of bias on $\beta_2$ in our model:
+
+|Omitted Variable Name|Description|Estimated Direction of Bias on $\beta_2$ |
+|:-- |:-- |:-: |
+|`social_dist_attitudes` | Categorical variable, 1 (Support) - 5 (Oppose), measures attitudes towards social distancing.|Positive (away from zero) |
+|`prop_wfh_option`|Proportion of population with the option to work from home.|Negative (toward zero)|
+|`testing_avail`|Availability of Covid-19 Testing.|Negative (toward zero)|
+|`ctac_tracing_date`|Date contract tracing program implemented.|Negative (toward zero)|
+|`first_covid_duration`|Elapsed time since first Covid-19 case in State|Positive (away from zero)|
+
+# Conclusion #
+
+The question we endeavored to answer in this analysis was: "Is there a relationship between state governor partisanship and the Covid-19 death toll?"
+
+Governors have direct control on state policies and emergency measures that address pandemics like Covid-19.  The narrative we often hear on various news outlets and other sources is that certain governors, particularly Republican ones, disregard public health risks in favor of their respective states' economies.  We found some evidence in our EDA that may support those narratives, such as the average days of sheltering in place for states with Republican governors was 32 as compared to 63 for states with Democratic governors.  However, there are many factors to be considered and it is not as simple as assuming a particular variable has a causal effect on another.  Therefore, we set out in this study to objectively determine if these allegations have merit.
+
+This is the model pertaining to our research question as determined by this study:
+
+$$log(death\_100k) = 0.7394  -0.174\  gov\_party + 0.504\ log(pop\_density) $$
+
+Based on our regression analysis, the coefficient for `gov_party` has no statistical significance, which implies practically, that the state governors' political party affiliations essentially have nothing to do with death tolls of the states. Even shelter-in-place duration, which has a meaningful correlation with partisanship as seen in the EDA, seemingly would affect the death toll, but did not in any statistically significant way.
+
+Rather, it appears that state Population Density (`pop_density`), which we found to have a high statistical significance, is a major factor behind higher death tolls.  
+
+However, even with the high statistical significance of the coefficient for the `log(pop_density)` variable, we need to be wary of bias.  It is very likely that certain variables, that we failed to consider, have been omitted from the model and therefore causing the estimators for the included ones, to be biased.
+
+In closing, we are reminded that we cannot always accept as fact what the media, political figures, or other persons of authority tell us.  That to get to the bottom of something, we need to rely on statistics.  The data does not lie.

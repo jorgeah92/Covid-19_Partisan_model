@@ -1,0 +1,2 @@
+state, total_cases, total_deaths, death_100k,cases_last_7_days,rate_per_100k, total_test_results,date_state_emerg,date_sip_start,date_sip_end,date_close_non_ess_bus,date_bus_reopen,date_emp_face_mask_req,unemploy_insur_max_amt,pop_density,pop_2018	pcnt_below_pov_2018,pcnt_ser_ill_risk_covid,count_all_cause_deaths_2018	prop_pop_0_18,prop_pop_19_25,prop_pop_26-34,prop_pop_35_54,prop_pop_55_64,prop_pop_65_over
+
